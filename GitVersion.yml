@@ -8,8 +8,8 @@ branches:
     regex: ^master$|^main$
     mode: ContinuousDelivery
     tag: ''
-    increment: Inherit
-    prevent-increment-of-merged-branch-version: true
+    increment: Patch
+    prevent-increment-of-merged-branch-version: false
     track-merge-target: false
     is-release-branch: true
     source-branches: [ 'dev', 'develop', 'release' ]
