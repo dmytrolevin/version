@@ -1,0 +1,335 @@
+name: Auto-fix Dependabot with Claude Code
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: read
+
+jobs:
+  fetch-and-fix:
+    runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Fetch alerts
+        id: fetch_alerts
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -e
+          echo "Fetching alerts for repo: $REPO"
+
+          echo "Fetching Dependabot alerts..."
+          if gh api "repos/$REPO/dependabot/alerts?per_page=100&state=open" > dependabot_alerts.json 2>/tmp/dep.err; then
+            dep_count=$(jq '. | length' dependabot_alerts.json)
+            echo "✓ Found $dep_count Dependabot alerts"
+          else
+            echo "ERROR fetching Dependabot:"; cat /tmp/dep.err
+            echo "[]" > dependabot_alerts.json
+            dep_count=0
+          fi
+
+          echo "Fetching Code Scanning alerts..."
+          if gh api "repos/$REPO/code-scanning/alerts?per_page=100&state=open" > code_scanning_alerts.json 2>/tmp/code.err; then
+            code_count=$(jq '. | length' code_scanning_alerts.json)
+            echo "✓ Found $code_count Code Scanning alerts"
+          else
+            if gh api "repos/$REPO/code-scanning/alerts" > code_scanning_alerts.json 2>/tmp/code2.err; then
+              code_count=$(jq '. | length' code_scanning_alerts.json)
+              echo "✓ Found $code_count Code Scanning alerts (alt endpoint)"
+            else
+              echo "Code Scanning endpoint not available or no alerts"
+              echo "[]" > code_scanning_alerts.json
+              code_count=0
+            fi
+          fi
+
+          total=$((dep_count + code_count))
+          echo "========================================"
+          echo "Total alerts: $total ($dep_count Dependabot + $code_count Code Scanning)"
+          echo "========================================"
+          echo "alerts_count=$total" >> $GITHUB_OUTPUT
+
+      - name: Stop if no alerts
+        if: steps.fetch_alerts.outputs.alerts_count == '0'
+        run: echo "No alerts found. Exiting."
+
+      # ──────────────────────────────────────────────────────────────
+      # APPROACH 1: Dependabot — Claude returns a shell command
+      # Runner executes the command, result is a real file change
+      # ──────────────────────────────────────────────────────────────
+      - name: Fix Dependabot alerts via package manager commands
+        if: steps.fetch_alerts.outputs.alerts_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -e
+          git config user.name "claude-bot"
+          git config user.email "claude-bot@users.noreply.github.com"
+          git config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          mkdir -p dep_fixes
+
+          default_branch=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || echo "main")
+          num_alerts=$(jq '. | length' dependabot_alerts.json)
+
+          if [ "$num_alerts" -eq 0 ]; then
+            echo "No Dependabot alerts to process"
+            exit 0
+          fi
+
+          strip_markdown() {
+            echo "$1" | sed '/^```/d'
+          }
+
+          claude_fix() {
+            local alert="$1"
+            jq -n \
+              --arg alert "$alert" \
+              '{
+                model: "claude-3-5-sonnet-20241022",
+                max_tokens: 1024,
+                system: "You are a security engineer. Given a GitHub Dependabot alert, return ONLY a raw JSON object (no markdown) with fields: \"command\" (shell command to update the dependency, e.g. \"npm install lodash@4.17.21\" or \"go get golang.org/x/net@v0.17.0\"), \"path\" (the manifest file that will change, e.g. \"package.json\"), \"summary\" (one-line description).",
+                messages: [{role: "user", content: ("Dependabot alert:\n\n" + $alert)}]
+              }' | \
+            curl -s -X POST "https://api.anthropic.com/v1/messages" \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d @-
+          }
+
+          for i in $(seq 0 $((num_alerts - 1))); do
+            idx=$((i+1))
+            alert=$(jq -c ".[$i]" dependabot_alerts.json)
+            alert_num=$(jq -r '.number' <<< "$alert")
+            package_name=$(jq -r '.dependency.package.name // "unknown"' <<< "$alert")
+            pkg_slug=$(echo "$package_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g')
+            branch="auto/claude-fix-dependabot-${alert_num}-${pkg_slug}"
+
+            echo ""
+            echo "[$idx/$num_alerts] Dependabot alert #${alert_num}: $package_name"
+
+            response=$(claude_fix "$alert")
+            if ! echo "$response" | jq -e '.content[0].text' >/dev/null 2>&1; then
+              echo "ERROR: Claude API failed: $(echo "$response" | jq -r '.error.message // "unknown"')"
+              continue
+            fi
+
+            raw=$(strip_markdown "$(echo "$response" | jq -r '.content[0].text')")
+            if ! echo "$raw" | jq . >/dev/null 2>&1; then
+              echo "ERROR: Claude returned invalid JSON: $raw"
+              continue
+            fi
+
+            command=$(echo "$raw" | jq -r '.command // empty')
+            manifest=$(echo "$raw" | jq -r '.path // empty')
+            summary=$(echo "$raw" | jq -r '.summary // "update dependency"')
+
+            if [ -z "$command" ] || [ -z "$manifest" ]; then
+              echo "SKIP: Claude did not return a command"
+              continue
+            fi
+
+            echo "  Command: $command"
+            echo "  File:    $manifest"
+
+            git checkout "$default_branch" 2>/dev/null || git checkout -b "$default_branch"
+            git checkout -B "$branch"
+
+            if bash -c "$command" 2>/tmp/cmd.err; then
+              echo "✓ Command executed"
+            else
+              echo "ERROR: Command failed:"; cat /tmp/cmd.err
+              git checkout "$default_branch" || true
+              continue
+            fi
+
+            if git diff --quiet; then
+              echo "SKIP: No file changes after command"
+              git checkout "$default_branch" || true
+              continue
+            fi
+
+            git add .
+            git commit -m "chore: claude fix [dependabot #${alert_num}]: $summary"
+            echo "✓ Committed"
+
+            if git push --set-upstream origin "$branch" --force 2>/tmp/push.err; then
+              echo "✓ Branch pushed"
+              if ! gh pr view "$branch" >/dev/null 2>&1; then
+                pr_title="Claude Fix [dependabot #${alert_num}]: ${summary}"
+                pr_body="Automated Dependabot fix for alert #${alert_num} (\`${package_name}\`).\n\n**Fix applied:** \`${command}\`\n\n> Generated by Claude via package manager command."
+                if gh pr create --title "$pr_title" --body "$(printf '%b' "$pr_body")" \
+                               --base "$default_branch" --head "$branch" 2>/tmp/pr.err; then
+                  echo "✓ PR created"
+                else
+                  echo "ERROR: PR creation failed:"; cat /tmp/pr.err
+                fi
+              else
+                echo "PR already exists for $branch"
+              fi
+            else
+              echo "ERROR: Push failed:"; cat /tmp/push.err
+            fi
+
+            git checkout "$default_branch" || true
+          done
+
+      # ──────────────────────────────────────────────────────────────
+      # APPROACH 2: CodeQL — Claude reads the real file, returns a patch
+      # We provide the actual file content so the diff is accurate
+      # ──────────────────────────────────────────────────────────────
+      - name: Fix CodeQL alerts via file-aware patch
+        if: steps.fetch_alerts.outputs.alerts_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -e
+          git config user.name "claude-bot"
+          git config user.email "claude-bot@users.noreply.github.com"
+          git config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+
+          strip_markdown() {
+            echo "$1" | sed '/^```/d'
+          }
+
+          default_branch=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || echo "main")
+          num_alerts=$(jq '. | length' code_scanning_alerts.json)
+
+          if [ "$num_alerts" -eq 0 ]; then
+            echo "No Code Scanning alerts to process"
+            exit 0
+          fi
+
+          for i in $(seq 0 $((num_alerts - 1))); do
+            idx=$((i+1))
+            alert=$(jq -c ".[$i]" code_scanning_alerts.json)
+            alert_num=$(jq -r '.number' <<< "$alert")
+            rule_name=$(jq -r '.rule.name // .rule.id // "unknown"' <<< "$alert")
+            file_path=$(jq -r '.most_recent_instance.location.path // empty' <<< "$alert")
+            start_line=$(jq -r '.most_recent_instance.location.start_line // ""' <<< "$alert")
+            message=$(jq -r '.most_recent_instance.message.text // ""' <<< "$alert")
+            rule_slug=$(echo "$rule_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g')
+            branch="auto/claude-fix-codeql-${alert_num}-${rule_slug}"
+
+            echo ""
+            echo "[$idx/$num_alerts] CodeQL alert #${alert_num}: $rule_name"
+
+            if [ -z "$file_path" ]; then
+              echo "SKIP: No file path in alert"
+              continue
+            fi
+
+            if [ ! -f "$file_path" ]; then
+              echo "SKIP: File not found in repo: $file_path"
+              continue
+            fi
+
+            file_content=$(cat "$file_path")
+            echo "  File: $file_path ($(wc -l < "$file_path") lines)"
+
+            # Ask Claude with full file content
+            response=$(jq -n \
+              --arg alert "$alert" \
+              --arg file_path "$file_path" \
+              --arg file_content "$file_content" \
+              --arg start_line "$start_line" \
+              --arg message "$message" \
+              '{
+                model: "claude-3-5-sonnet-20241022",
+                max_tokens: 8192,
+                system: "You are a security engineer fixing code vulnerabilities. You will receive a CodeQL alert and the FULL content of the affected file. Return ONLY a raw JSON object (no markdown) with fields: \"fixed_content\" (the COMPLETE, updated file content with the vulnerability fixed), \"summary\" (one-line description of the fix). You MUST return the entire file content natively formatted. NEVER use placeholders like `// ... rest of code`. Output the FULL file content.",
+                messages: [{
+                  role: "user",
+                  content: ("CodeQL alert:\n" + $alert + "\n\nVulnerability at line " + $start_line + ": " + $message + "\n\nFull content of " + $file_path + ":\n```\n" + $file_content + "\n```\n\nProvide the complete fixed file content.")
+                }]
+              }' | \
+              curl -s -X POST "https://api.anthropic.com/v1/messages" \
+                -H "x-api-key: $ANTHROPIC_API_KEY" \
+                -H "anthropic-version: 2023-06-01" \
+                -H "content-type: application/json" \
+                -d @-)
+
+            if ! echo "$response" | jq -e '.content[0].text' >/dev/null 2>&1; then
+              echo "ERROR: Claude API failed: $(echo "$response" | jq -r '.error.message // "unknown"')"
+              continue
+            fi
+
+            raw=$(strip_markdown "$(echo "$response" | jq -r '.content[0].text')")
+            if ! echo "$raw" | jq . >/dev/null 2>&1; then
+              echo "ERROR: Claude returned invalid JSON"
+              continue
+            fi
+
+            fixed_content=$(echo "$raw" | jq -r '.fixed_content // empty')
+            summary=$(echo "$raw" | jq -r '.summary // "fix code vulnerability"')
+
+            if [ -z "$fixed_content" ]; then
+              echo "SKIP: Claude did not return fixed content"
+              continue
+            fi
+
+            git checkout "$default_branch" 2>/dev/null || git checkout -b "$default_branch"
+            git checkout -B "$branch"
+
+            printf "%s\n" "$fixed_content" > "$file_path"
+            echo "✓ File updated"
+
+            if git diff --quiet HEAD; then
+              echo "SKIP: No changes after patch"
+              git checkout "$default_branch" || true
+              continue
+            fi
+
+            git add "$file_path"
+            git commit -m "chore: claude fix [codeql #${alert_num}]: $summary"
+            echo "✓ Committed"
+
+            new_commits=$(git log "$default_branch".."$branch" --oneline 2>/dev/null | wc -l)
+            if [ "$new_commits" -eq 0 ]; then
+              echo "SKIP: No new commits vs $default_branch"
+              git checkout "$default_branch" || true
+              continue
+            fi
+
+            if git push --set-upstream origin "$branch" --force 2>/tmp/push.err; then
+              echo "✓ Branch pushed"
+              if ! gh pr view "$branch" >/dev/null 2>&1; then
+                pr_title="Claude Fix [codeql #${alert_num}]: ${summary}"
+                pr_body="Automated CodeQL fix for alert #${alert_num} (\`${rule_name}\`).\n\n**File:** \`${file_path}\` (line ${start_line})\n**Issue:** ${message}\n\n> Generated by Claude with full file context."
+                if gh pr create --title "$pr_title" --body "$(printf '%b' "$pr_body")" \
+                               --base "$default_branch" --head "$branch" 2>/tmp/pr.err; then
+                  echo "✓ PR created"
+                else
+                  echo "ERROR: PR creation failed:"; cat /tmp/pr.err
+                fi
+              else
+                echo "PR already exists for $branch"
+              fi
+            else
+              echo "ERROR: Push failed:"; cat /tmp/push.err
+            fi
+
+            git checkout "$default_branch" || true
+          done

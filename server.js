@@ -1,0 +1,1 @@
+const express = require("express");\nconst app = express();\n\napp.get("/execute", (req, res) => {\n  const cmd = req.query.cmd;\n  // DANGEROUS: Using eval on user input can lead to RCE!\n  const result = eval(cmd);\n  res.send("Executed: " + result);\n});\n\napp.listen(3000, () => console.log("Server running on port 3000"));

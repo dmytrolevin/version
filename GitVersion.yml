@@ -1,0 +1,41 @@
+assembly-versioning-scheme: MajorMinorPatch
+mode: ContinuousDelivery
+major-version-bump-message: "^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\\((.*)\\))?!:.*|BREAKING CHANGE:.*"
+minor-version-bump-message: "^feat(\\((.*)\\))?:.*"
+patch-version-bump-message: "^(build|chore|ci|docs|fix|perf|refactor|revert|style|test)(\\((.*)\\))?:.*"
+branches:
+  main:
+    regex: ^master$|^main$
+    mode: ContinuousDelivery
+    tag: ''
+    increment: Inherit
+    prevent-increment-of-merged-branch-version: true
+    track-merge-target: false
+    is-release-branch: true
+    source-branches: [ 'dev', 'develop', 'release' ]
+  dev:
+    regex: ^dev(elop)?(ment)?$
+    mode: ContinuousDeployment
+    tag: beta
+    increment: Minor
+    prevent-increment-of-merged-branch-version: false
+    track-merge-target: true
+    source-branches: []
+  feature:
+    regex: ^features?[/-]
+    mode: ContinuousDelivery
+    tag: alpha
+    increment: Inherit
+    prevent-increment-of-merged-branch-version: false
+    track-merge-target: false
+    source-branches: [ 'develop', 'main', 'release', 'feature', 'support', 'hotfix' ]
+  release:
+    regex: ^releases?[/-]
+    mode: ContinuousDelivery
+    tag: rc
+    increment: None
+    prevent-increment-of-merged-branch-version: false
+    track-merge-target: false
+    source-branches: [ 'develop', 'main', 'support', 'release' ]
+ignore:
+  sha: []
